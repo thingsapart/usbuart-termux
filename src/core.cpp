@@ -701,6 +701,23 @@ public:
 		return attach(find(addr), addr.ifc, ch, pi);
 	}
 
+	inline int attach(int fd, uint8_t ifc, channel ch,
+			const eia_tia_232_info& pi) throw(error_t) {
+		validate(pi);
+		validate(ch);
+
+    libusb_context *context;
+    libusb_device_handle *handle;
+    libusb_device *device;
+    struct libusb_device_descriptor desc;
+
+    libusb_set_option(NULL, LIBUSB_OPTION_NO_DEVICE_DISCOVERY);
+    assert(!libusb_wrap_sys_device(ctx, (intptr_t) fd, &handle));
+    device = libusb_get_device(handle);
+
+		return attach(device, ifc, ch, pi);
+	}
+
 	int attach(libusb_device* dev, uint8_t ifc, channel& ch,
 			const eia_tia_232_info& pi, bool pipes = false) throw(error_t) {
 		bool ok1 = false, ok2 = false;

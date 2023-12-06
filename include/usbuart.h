@@ -245,6 +245,15 @@ public:
 	 */
 	int attach(device_addr ba, channel ch, const eia_tia_232_info& pi) noexcept;
 
+	/** Attach pair of file descriptors to the USB device using FD.
+	 * @param	fd - file descriptor representing USB device stream
+	 * @param	ifc - interface number
+	 * @param	ch - pair of file descriptors
+	 * @param	pi - protocol information
+	 * @returns 0 on success or error code
+	 */
+	int attach(int fd, uint8_t ifc, channel ch, const eia_tia_232_info& pi) noexcept;
+
 	/** Create two pipes and attach their ends to the USB device using VID/PID.
 	 * @param	id - USB bus ID/device address
 	 * @param	ch - destination that accepts pair of file descriptors
