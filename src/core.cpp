@@ -35,6 +35,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <libusb.h>
+#include <assert.h>
 #include "usbuart.hpp"
 #include "vector_lock.hpp"
 
@@ -653,10 +654,20 @@ private:
 class context::backend {
 public:
 	backend() throw(error_t) {
+		libusb_set_option(NULL, LIBUSB_OPTION_WEAK_AUTHORITY);
+		libusb_set_option(NULL, LIBUSB_OPTION_NO_DEVICE_DISCOVERY);
+
 		if( int err = libusb_init(&ctx) ) {
 			log.e(__,"libusb_error %d : %s", err, libusb_error_name(err));
 			throw error_t::libusb_error;
 		}
+
+#if 0
+		if ( int  err = libusb_set_option(ctx, LIBUSB_OPTION_USE_USBDK) ) {
+			log.e(__,"libusb_error setting USBDK backend");
+		    throw error_t::libusb_error;
+		}
+#endif
 	}
 	~backend() {
 		log.d(__,"this=%p", this);
@@ -701,28 +712,35 @@ public:
 		return attach(find(addr), addr.ifc, ch, pi);
 	}
 
+	libusb_device *open_usb_fd(int fd, libusb_device_handle **handle) {
+		libusb_device *device;
+
+		assert(!libusb_wrap_sys_device(ctx, (intptr_t) fd, handle));
+		device = libusb_get_device(*handle);
+
+		struct libusb_device_descriptor desc;
+		assert(!libusb_get_device_descriptor(device, &desc));
+		printf("Vendor ID: %04x\n", desc.idVendor);
+		printf("Product ID: %04x\n", desc.idProduct);
+
+		return device;
+	}
+
 	inline int attach(int fd, uint8_t ifc, channel ch,
 			const eia_tia_232_info& pi) throw(error_t) {
 		validate(pi);
 		validate(ch);
-
-    libusb_context *context;
-    libusb_device_handle *handle;
-    libusb_device *device;
-    struct libusb_device_descriptor desc;
-
-    libusb_set_option(NULL, LIBUSB_OPTION_NO_DEVICE_DISCOVERY);
-    assert(!libusb_wrap_sys_device(ctx, (intptr_t) fd, &handle));
-    device = libusb_get_device(handle);
-
-		return attach(device, ifc, ch, pi);
+		libusb_device_handle *handle;
+		return attach(open_usb_fd(fd, &handle), ifc, ch, pi, false, handle);
 	}
 
 	int attach(libusb_device* dev, uint8_t ifc, channel& ch,
-			const eia_tia_232_info& pi, bool pipes = false) throw(error_t) {
+			const eia_tia_232_info& pi, bool pipes = false, libusb_device_handle *handle = NULL) throw(error_t) {
 		bool ok1 = false, ok2 = false;
 		if( dev == nullptr ) return -error_t::no_device;
-		transaction<driver> drv(ok1, create(dev, ifc));
+
+		printf("HANDLE: %p\n", handle);
+		transaction<driver> drv(ok1, create(dev, ifc, handle));
 		transaction<file_channel> child(ok2, (pipes ?
 			new pipe_channel(*this, ch, drv):new file_channel(*this, ch, drv)));
 		ok1 = true;
@@ -745,6 +763,13 @@ public:
 			const eia_tia_232_info& pi) throw(error_t) {
 		validate(pi);
 		return attach(find(ba), ba.ifc, ch, pi, true);
+	}
+
+	inline int pipe(int fd, channel& ch,
+			const eia_tia_232_info& pi) throw(error_t) {
+		validate(pi);
+		libusb_device_handle *handle;
+		return attach(open_usb_fd(fd, &handle), 0, ch, pi, true, handle);
 	}
 
 	void append_poll_list(vector<pollfd>& list) noexcept {
@@ -819,21 +844,25 @@ public:
 		});
 	}
 
-	driver* create(libusb_device* dev, uint8_t id) throw(error_t) {
-		libusb_device_handle* devh;
-		int res = libusb_open(dev, &devh);
-		libusb_unref_device(dev); /* it was refed in find */
-		if( res ) {
-			int err = errno;
-			log.i(__,"libusb_open fail (%d) %s%s%s", res,
-				libusb_error_name(res), (errno ? ", " : ""),
-				(errno ? strerror(errno) : ""));
-			throw_error(__, err == 0 ? res : err);
+	driver* create(libusb_device* dev, uint8_t id, libusb_device_handle* devh) throw(error_t) {
+		if (devh == nullptr) {
+			int res = libusb_open(dev, &devh);
+			libusb_unref_device(dev); /* it was refed in find */
+			if( res ) {
+				int err = errno;
+				log.i(__,"libusb_open fail (%d) %s%s%s", res,
+					libusb_error_name(res), (errno ? ", " : ""),
+					(errno ? strerror(errno) : ""));
+				throw_error(__, err == 0 ? res : err);
+			}
 		}
 
 		bool success = false;
+		printf("SUCCESS: %d\n", success);
 		transaction<libusb_device_handle> begin(success, devh);
+		printf("SUCCESS1: %d\n", success);
 		driver* result = registrar().create(devh,id);
+		printf("SUCCESS2: %d\n", success);
 		success = result != nullptr;
 		return result;
 	}
@@ -954,8 +983,18 @@ int context::attach(device_id id, channel ch,
 	return safe(__,[&]{ return priv->attach(id,ch,pi); });
 }
 
+int context::attach(int fd, uint8_t ifc, channel ch,
+		const eia_tia_232_info& pi) noexcept {
+	return safe(__,[&]{ return priv->attach(fd,ifc,ch,pi); });
+}
+
 int context::attach(device_addr ba, channel ch, const eia_tia_232_info& pi) noexcept {
 	return safe(__,[&]{ return priv->attach(ba,ch,pi); });
+}
+
+int context::pipe(int fd, channel& ch,
+		const eia_tia_232_info& pi) noexcept {
+	return safe(__,[&]{ return priv->pipe(fd,ch,pi); });
 }
 
 int context::pipe(device_id id, channel& ch,

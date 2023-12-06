@@ -22,19 +22,19 @@
 
 MAKEFLAGS += --no-builtin-rules
 TARGET-DIR := bin
-BUILD-DIR ?= /tmp/usbuart
+BUILD-DIR ?= ~/usbuart-termux
 BOLD:=$(shell tput bold)
 NORM:=$(shell tput sgr0)
 
-CC  := $(if $(V),,@)$(PREFIX)gcc$(SUFFIX)
-CXX := $(if $(V),,@)$(PREFIX)g++$(SUFFIX)
-LD  := $(if $(V),,@)$(PREFIX)g++$(SUFFIX)
+CC  := $(if $(V),,@)$(PREFIX)/bin/clang$(SUFFIX)
+CXX := $(if $(V),,@)$(PREFIX)/bin/clang++$(SUFFIX)
+LD  := $(if $(V),,@)$(PREFIX)/bin/clang++$(SUFFIX)
 
 MAKEFLAGS += --no-builtin-rules
 
 SRC-DIRS := src
 
-INCLUDES := include libusb/libusb
+INCLUDES := include $(PREFIX)/include/libusb-1.0 libusb/libusb
 
 .PHONY: all
 
@@ -62,27 +62,41 @@ CPPFLAGS += 																\
   $(if $(V),-v,)															\
   -Wall																		\
   -Wextra																	\
-  -O3																		\
-  -fmessage-length=0														\
-  -ffunction-sections  														\
-  -fdata-sections															\
+  -O0																		\
   -std=c++1y  																\
+  #-fmessage-length=0														\
+  #-ffunction-sections  														\
+  #-fdata-sections															\
 
+CPPFLAGS_DEBUG += 																\
+  $(addprefix -I,$(INCLUDES))												\
+  $(addprefix -D,$(CXX-DEFS))												\
+  $(if $(V),-v,)															\
+  -Wall																		\
+  -Wextra																	\
+  -O0																		\
+  -std=c++1y  																\
+  #-fmessage-length=0														\
+  #-ffunction-sections  														\
+  #-fdata-sections															\
+  #-g \
 
 CFLAGS += 																	\
   $(addprefix -I,$(INCLUDES))												\
   $(addprefix -D,$(CXX-DEFS))												\
   $(if $(V),-v,)															\
   -Wall																		\
-  -O3																		\
-  -ffunction-sections 														\
-  -fdata-sections 															\
-  -std=gnu99 																\
+  -O0																		\
+  #-ffunction-sections 														\
+  #-fdata-sections 															\
+  #-std=gnu99 																\
 
 
 LDFLAGS +=																	\
-  -s -shared				 												\
+  -s -shared 				 												\
 
+
+LDFLAGS_DEBUG +=																	\
 
 vpath %.cpp $(subst $(eval) ,:,$(SRC-DIRS))
 vpath %.c   $(subst $(eval) ,:,$(SRC-DIRS))
@@ -111,3 +125,20 @@ clean:
 	@rm -f $(BUILD-DIR)/*.o *.map $(TARGET-DIR)/*.so
 
 
+vpath %.cpp $(subst $(eval) ,:,examples)
+
+examples/%.o: %.cpp
+	@echo "    $(BOLD)c++$(NORM)" $(notdir $<)
+	@echo $(CXX) $(CPPFLAGS_DEBUG) -c -o $@ $<
+	$(CXX) $(CPPFLAGS_DEBUG) -c -o $@ $<
+
+uartcat: examples/uartcat-termux.o
+	@echo "    $(BOLD)ld$(NORM) " $(notdir $@)
+	@echo $(LD) $(LDFLAGS_DEBUG) -Lusb -Lusbuart -o $@ $^
+	$(LD) $(LDFLAGS_DEBUG) -L$(PREFIX)/lib/libusb-1.0 -L./bin -lusb-1.0 -lusbuart -o $@ $^
+	
+
+test: examples/test.o
+	@echo "    $(BOLD)ld$(NORM) " $(notdir $@)
+	@echo $(LD) $(LDFLAGS_DEBUG) -o $@ $^
+	$(LD) $(LDFLAGS_DEBUG) -L$(PREFIX)/lib/libusb-1.0 -L./bin -lusb-1.0 -lusbuart -o $@ $^

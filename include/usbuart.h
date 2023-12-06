@@ -255,6 +255,14 @@ public:
 	int attach(int fd, uint8_t ifc, channel ch, const eia_tia_232_info& pi) noexcept;
 
 	/** Create two pipes and attach their ends to the USB device using VID/PID.
+	 * @param	fd - usb device file descriptor
+	 * @param	ch - destination that accepts pair of file descriptors
+	 * @param	pi - protocol information
+	 * @returns 0 on success or error code
+	 */
+	int pipe(int fd, channel& ch, const eia_tia_232_info& pi) noexcept;
+
+	/** Create two pipes and attach their ends to the USB device using VID/PID.
 	 * @param	id - USB bus ID/device address
 	 * @param	ch - destination that accepts pair of file descriptors
 	 * @param	pi - protocol information
