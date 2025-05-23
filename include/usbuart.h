@@ -245,7 +245,8 @@ public:
 	 */
 	int attach(device_addr ba, channel ch, const eia_tia_232_info& pi) noexcept;
 
-	/** Attach pair of file descriptors to the USB device using FD.
+	/** Attach pair of file descriptors to the USB device using an OS file descriptor.
+	 * Suitable for use with pre-opened FDs, e.g., from Android Termux.
 	 * @param	fd - file descriptor representing USB device stream
 	 * @param	ifc - interface number
 	 * @param	ch - pair of file descriptors
@@ -254,7 +255,8 @@ public:
 	 */
 	int attach(int fd, uint8_t ifc, channel ch, const eia_tia_232_info& pi) noexcept;
 
-	/** Create two pipes and attach their ends to the USB device using VID/PID.
+	/** Create two pipes and attach their ends to the USB device using an OS file descriptor.
+	 * Suitable for use with pre-opened FDs, e.g., from Android Termux.
 	 * @param	fd - usb device file descriptor
 	 * @param	ch - destination that accepts pair of file descriptors
 	 * @param	pi - protocol information
