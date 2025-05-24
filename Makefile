@@ -63,6 +63,7 @@ CPPFLAGS += 																\
   $(if $(V),-v,)															\
   -Wall																		\
   -Wextra																	\
+  -fPIC																	\
   -O0																		\
   -std=c++1y  																\
   #-fmessage-length=0														\
@@ -76,6 +77,7 @@ CPPFLAGS_DEBUG += 																\
   -Wall																		\
   -Wextra																	\
   -O0																		\
+  -fPIC																	\
   -std=c++1y  																\
   #-fmessage-length=0														\
   #-ffunction-sections  														\
@@ -88,6 +90,7 @@ CFLAGS += 																	\
   $(addprefix -D,$(CXX-DEFS))												\
   $(if $(V),-v,)															\
   -Wall																		\
+  -fPIC																	\
   -O0																		\
   #-ffunction-sections 														\
   #-fdata-sections 															\
