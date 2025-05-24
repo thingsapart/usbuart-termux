@@ -1,343 +1,285 @@
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
+// termux_uart_bridge.cpp
+#include <iostream>
 #include <string>
 #include <vector>
-#include <unistd.h>
-#include <fcntl.h>
-#include <sys/stat.h>
+#include <thread>
+#include <atomic>
 #include <csignal>
-#include <cerrno> // For errno
-#include "usbuart.h" // Assuming this path will be correct relative to where it's compiled
+#include <cstdlib>      // getenv, atoi, EXIT_FAILURE, EXIT_SUCCESS
+#include <cstring>      // strerror
+#include <fcntl.h>      // open, O_RDONLY, O_WRONLY, O_NONBLOCK
+#include <unistd.h>     // read, write, close, unlink
+#include <sys/stat.h>   // mkfifo, mode_t
+#include <sys/poll.h>   // poll, pollfd
+#include <cerrno>       // errno
 
-// Global for signal handling to allow cleanup
-volatile bool running = true;
-std::string named_pipe_path_global = "";
+#include "usbuart.h" // Your provided header
+
+const char* PIPE_NAME = "./serial_pipe";
+std::atomic<bool> quit_flag(false);
 
 void signal_handler(int signum) {
-    fprintf(stderr, "Caught signal %d, shutting down.\n", signum);
-    running = false;
+    std::cerr << "Signal " << signum << " received, initiating shutdown..." << std::endl;
+    quit_flag.store(true);
 }
 
-void print_usage(const char* prog_name) {
-    fprintf(stderr, "Usage: %s <USB_DEVICE_SYSFS_PATH> <TERMUX_NAMED_PIPE_PATH>\n", prog_name);
-    fprintf(stderr, "Internal usage (by termux-usb): %s <FILE_DESCRIPTOR> <TERMUX_NAMED_PIPE_PATH>\n", prog_name);
-}
-
-int main(int argc, char** argv) {
-    std::string usb_device_path_str;
-    std::string named_pipe_path_str;
-    int usb_fd = -1;
-
-    // Setup signal handling early
-    struct sigaction action;
-    memset(&action, 0, sizeof(action));
-    action.sa_handler = signal_handler;
-    sigaction(SIGINT, &action, NULL);
-    sigaction(SIGTERM, &action, NULL);
-
-    if (argc == 3) {
-        // Could be initial user call OR termux-usb re-invocation
-        char* p_end_first_arg;
-        long fd_candidate = strtol(argv[1], &p_end_first_arg, 10);
-
-        if (*p_end_first_arg == 0) { 
-            // First argument is a number, assume it's FD from termux-usb
-            usb_fd = static_cast<int>(fd_candidate);
-            named_pipe_path_str = argv[2];
-            named_pipe_path_global = named_pipe_path_str; // Store for cleanup
-            fprintf(stdout, "Invoked by termux-usb. FD: %d, Pipe: %s\n", usb_fd, named_pipe_path_str.c_str());
-        } else {
-            // First argument is not a number, assume it's the initial user call
-            usb_device_path_str = argv[1];
-            named_pipe_path_str = argv[2];
-            fprintf(stdout, "Direct user call. USB: %s, Pipe: %s. Re-invoking via termux-usb...\n", 
-                    usb_device_path_str.c_str(), named_pipe_path_str.c_str());
-
-            char* exec_args[7]; // Max 6 args + NULL
-            exec_args[0] = (char*)"termux-usb";
-            exec_args[1] = (char*)"-r"; // Request permission
-            exec_args[2] = (char*)"-e"; // Execute
-            exec_args[3] = argv[0];     // Path to this executable
-            exec_args[4] = (char*)usb_device_path_str.c_str(); // USB device path for termux-usb
-            exec_args[5] = (char*)named_pipe_path_str.c_str(); // Named pipe path as an argument to this program
-            exec_args[6] = NULL;
-
-            // termux-usb will call: argv[0] <FD> named_pipe_path_str
-            
-            execvp(exec_args[0], exec_args);
-            // If execvp returns, it's an error
-            perror("execvp failed to re-invoke with termux-usb");
-            return 1;
+// Helper function to write all data, handling short writes and EINTR
+bool write_all(int fd, const char* buf, ssize_t len) {
+    ssize_t written = 0;
+    while (written < len) {
+        ssize_t ret = write(fd, buf + written, len - written);
+        if (ret < 0) {
+            if (errno == EINTR) continue;
+            std::cerr << "write_all error: " << strerror(errno) << " on fd " << fd << std::endl;
+            return false;
         }
-    } else {
-        fprintf(stderr, "Invalid number of arguments.\n");
-        print_usage(argv[0]);
-        return 1;
+        if (ret == 0 && len > 0) { // Should not happen for blocking write unless fd is strange
+            std::cerr << "write_all error: wrote 0 bytes on fd " << fd << std::endl;
+            return false;
+        }
+        written += ret;
     }
+    return true;
+}
 
-    if (usb_fd == -1) {
-        fprintf(stderr, "Error: Failed to obtain USB file descriptor after argument processing.\n");
-        return 1;
+int main(int argc, char* argv[]) {
+    // 1. Get Termux USB FD
+    const char* termux_usb_fd_str = getenv("TERMUX_USB_FD");
+    if (!termux_usb_fd_str) {
+        std::cerr << "Error: TERMUX_USB_FD environment variable not set." << std::endl;
+        std::cerr << "Run this executable via: termux-usb -e termux_uart_bridge -r /dev/bus/usb/XXX/YYY" << std::endl;
+        return EXIT_FAILURE;
     }
+    int usb_dev_fd = atoi(termux_usb_fd_str);
+    if (usb_dev_fd <= 0) { // FDs are positive integers, typically >= 3 for passed FDs
+        std::cerr << "Error: Invalid TERMUX_USB_FD value: " << termux_usb_fd_str << std::endl;
+        return EXIT_FAILURE;
+    }
+    std::cout << "Using USB device FD: " << usb_dev_fd << std::endl;
 
-    fprintf(stdout, "Proceeding with USB FD: %d and Named Pipe: %s\n", usb_fd, named_pipe_path_str.c_str());
+    // 2. Setup signal handling
+    struct sigaction sa;
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0; // No SA_RESTART, so syscalls might be interrupted
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
 
-    // 1. Create Named Pipe
-    if (mkfifo(named_pipe_path_str.c_str(), 0666) == -1) {
+    // 3. UART parameters (default, could be command-line args)
+    usbuart::eia_tia_232_info uart_params = usbuart::_115200_8N1n;
+    uint8_t usb_ifc_num = 0; // Common default for USB-serial adapters
+
+    // 4. Initialize usbuart context
+    usbuart::context& uart_ctx = usbuart::context::instance(); // Get singleton
+    // usbuart::context::setloglevel(usbuart::loglevel_t::debug); // Optional: for more verbose logging
+
+    usbuart::channel termux_usb_channel = usbuart::bad_channel;
+    int usbuart_ret = uart_ctx.pipe(usb_dev_fd, usb_ifc_num, termux_usb_channel, uart_params);
+
+    if (usbuart_ret != +usbuart::error_t::success) {
+        std::cerr << "Error: usbuart_ctx.pipe failed with code: " << usbuart_ret << std::endl;
+        // Note: The original TERMUX_USB_FD (usb_dev_fd) is managed by termux-usb,
+        // we should not close it here. The usbuart library will handle its copy.
+        return EXIT_FAILURE;
+    }
+    std::cout << "USB UART channel opened: usbuart_read_fd=" << termux_usb_channel.fd_read 
+              << ", usbuart_write_fd=" << termux_usb_channel.fd_write << std::endl;
+
+    // 5. Create and open named pipe
+    if (mkfifo(PIPE_NAME, 0666) < 0) {
         if (errno != EEXIST) {
-            perror("mkfifo failed");
-            // Cleanup potentially created pipe if things go wrong later (though here it's fatal)
-            // unlink(named_pipe_path_str.c_str()); // Not strictly needed if exiting
-            return 1;
+            std::cerr << "Error: mkfifo(\"" << PIPE_NAME << "\") failed: " << strerror(errno) << std::endl;
+            uart_ctx.close(termux_usb_channel);
+            return EXIT_FAILURE;
         }
-        fprintf(stdout, "Named pipe %s already exists. Using existing.\n", named_pipe_path_str.c_str());
+        std::cout << "Named pipe \"" << PIPE_NAME << "\" already exists. Using it." << std::endl;
     } else {
-        fprintf(stdout, "Named pipe %s created.\n", named_pipe_path_str.c_str());
+        std::cout << "Named pipe \"" << PIPE_NAME << "\" created." << std::endl;
     }
 
-    // Initialize usbuart context
-    usbuart::context ctx;
-    usbuart::channel dev_channel = {-1, -1}; // To be filled by usbuart
-    // Default serial parameters, e.g., Klipper's common 250000 or standard 115200
-    // For now, using a common default from usbuart.h
-    const usbuart::eia_tia_232_info serial_params = usbuart::_115200_8N1n; 
-    // Interface number, usually 0 for single interface USB-serial devices
-    uint8_t interface_number = 0; 
+    // Open named pipe for reading (data from user -> to USB)
+    // This will block until a writer opens the other end.
+    std::cout << "Waiting for a writer to connect to " << PIPE_NAME << "..." << std::endl;
+    int pipe_user_read_fd = open(PIPE_NAME, O_RDONLY);
+    if (pipe_user_read_fd < 0) {
+        std::cerr << "Error: open(\"" << PIPE_NAME << "\", O_RDONLY) failed: " << strerror(errno) << std::endl;
+        uart_ctx.close(termux_usb_channel);
+        unlink(PIPE_NAME); // Attempt to clean up
+        return EXIT_FAILURE;
+    }
+    std::cout << PIPE_NAME << " opened for reading from user." << std::endl;
 
-    // Use context::pipe to let usbuart create and manage its own internal pipes
-    // for fd_read/fd_write that will be connected to the USB device.
-    // OR use context::attach if we were to manage the FDs for the pipe to usbuart ourselves.
-    // For piping to a named pipe, context::pipe is more straightforward with usbuart's model.
-    
-    fprintf(stdout, "Attempting to initialize usbuart with FD %d...\n", usb_fd);
-    // The `pipe` method is suitable here as it sets up the channel struct with FDs for reading/writing to the USB device.
-    int attach_res = ctx.pipe(usb_fd, dev_channel, serial_params); 
-    // Note: The usbuart `pipe` method when given an FD might be misleadingly named.
-    // It should internally use the FD for the USB device and then create its *own* pipes for the channel.fd_read/write.
-    // Let's assume context::attach(usb_fd, interface_number, some_other_channel_for_usbuart_to_use, serial_params)
-    // is what we want if we want to bridge the named pipe to usbuart's direct read/write.
-    // The existing usbuart example `uartcat.cpp` uses `ctx.attach(devid, chnl, _115200_8N1n);` where chnl is {0,1} for stdin/stdout.
-    // We need to use the FD based attach: `ctx.attach(usb_fd, interface_number, host_fds_for_usb_data, serial_params)`
-    // The `host_fds_for_usb_data` will then be used in our poll loop.
+    // Open named pipe for writing (data from USB -> to user)
+    // This will block until a reader opens the other end.
+    std::cout << "Waiting for a reader to connect to " << PIPE_NAME << "..." << std::endl;
+    int pipe_user_write_fd = open(PIPE_NAME, O_WRONLY);
+    if (pipe_user_write_fd < 0) {
+        std::cerr << "Error: open(\"" << PIPE_NAME << "\", O_WRONLY) failed: " << strerror(errno) << std::endl;
+        close(pipe_user_read_fd);
+        uart_ctx.close(termux_usb_channel);
+        unlink(PIPE_NAME);
+        return EXIT_FAILURE;
+    }
+    std::cout << PIPE_NAME << " opened for writing to user." << std::endl;
+    std::cout << "Bridge is active. Press Ctrl+C to exit." << std::endl;
+    std::cout << "In other Termux sessions, run:" << std::endl;
+    std::cout << "  cat > " << PIPE_NAME << "  # To send data to USB device" << std::endl;
+    std::cout << "  cat " << PIPE_NAME << "    # To receive data from USB device" << std::endl;
 
-    // Let's use `ctx.attach` and we will need to create a pipe pair for usbuart to use internally for its read/write operations
-    // against the USB device, which we then bridge to our named pipe.
-    // This matches the plan: "Call context::pipe() (or a similar method adapted for this mode) to get the usbuart::channel (containing fd_read and fd_write for the USB device)."
-    // The `usbuart_pipe_byaddr` C function and `context::pipe` C++ function are designed to create a new pair of FDs (a pipe)
-    // that then get bridged to the USB device internally by usbuart.
 
-    if (attach_res != 0) {
-        fprintf(stderr, "Failed to attach to USB device via FD %d. Error: %d\n", usb_fd, attach_res);
-        if (!named_pipe_path_global.empty() && errno != EEXIST) { // Only unlink if we created it
-             unlink(named_pipe_path_global.c_str());
+    // 6. Start usbuart_loop in a thread
+    std::thread uart_loop_thread([&uart_ctx]() {
+        std::cout << "usbuart_loop thread started." << std::endl;
+        int loop_ret = uart_ctx.loop(-1); // Loop indefinitely until no channels or error
+        // This loop should exit when uart_ctx.close() is called on its channel or if an error occurs.
+        std::cout << "usbuart_loop thread finished with code: " << loop_ret << std::endl;
+    });
+
+    // 7. Main relay loop using poll
+    struct pollfd fds[2];
+    char buffer[4096]; // Buffer for relaying data
+
+    // FD for reading from named pipe (user input -> USB)
+    fds[0].fd = pipe_user_read_fd;
+    fds[0].events = POLLIN;
+
+    // FD for reading from usbuart (USB input -> user output)
+    fds[1].fd = termux_usb_channel.fd_read;
+    fds[1].events = POLLIN;
+
+    bool pipe_user_read_eof = false;
+    bool termux_usb_read_eof = false;
+
+    while (!quit_flag.load()) {
+        if (pipe_user_read_eof && termux_usb_read_eof) {
+            std::cout << "Both sides EOF. Exiting relay loop." << std::endl;
+            break; // Both sides are done
         }
-        return 1;
-    }
 
-    fprintf(stdout, "usbuart attached successfully. Channel FDs: read=%d, write=%d\n", dev_channel.fd_read, dev_channel.fd_write);
-    fprintf(stdout, "Ready to bridge data between %s and USB device.\n", named_pipe_path_str.c_str());
+        struct pollfd current_fds[2];
+        int nfds_to_poll = 0;
 
-    int named_pipe_fd_read = -1;
-    int named_pipe_fd_write = -1;
-    char buffer[4096]; // Data buffer for transfers
-
-    // Set usbuart channel FDs to non-blocking for use with poll
-    // fd_read from usbuart (data from USB)
-    if (fcntl(dev_channel.fd_read, F_SETFL, O_NONBLOCK) < 0) {
-        perror("fcntl on dev_channel.fd_read failed");
-        running = false; // Signal to proceed to cleanup
-    }
-    // fd_write to usbuart (data to USB)
-    // Writing to usbuart's fd_write might not need to be non-blocking
-    // if usbuart handles that internally, but read definitely does.
-
-    if (running) {
-        fprintf(stdout, "Opening named pipe %s for writing...\n", named_pipe_path_str.c_str());
-        named_pipe_fd_write = open(named_pipe_path_str.c_str(), O_WRONLY);
-        if (named_pipe_fd_write < 0) {
-            perror("Failed to open named pipe for writing");
-            running = false; // Signal to proceed to cleanup
-        } else {
-            fprintf(stdout, "Named pipe %s opened for writing (FD: %d).\n", named_pipe_path_str.c_str(), named_pipe_fd_write);
+        if (!pipe_user_read_eof) {
+            current_fds[nfds_to_poll++] = fds[0];
         }
-    }
-
-    if (running) {
-        fprintf(stdout, "Opening named pipe %s for reading...\n", named_pipe_path_str.c_str());
-        named_pipe_fd_read = open(named_pipe_path_str.c_str(), O_RDONLY);
-        if (named_pipe_fd_read < 0) {
-            perror("Failed to open named pipe for reading");
-            running = false; // Signal to proceed to cleanup
-        } else {
-            fprintf(stdout, "Named pipe %s opened for reading (FD: %d).\n", named_pipe_path_str.c_str(), named_pipe_fd_read);
+        if (!termux_usb_read_eof) {
+            current_fds[nfds_to_poll++] = fds[1];
         }
-    }
-    
-    if (running) {
-        // Set named pipe read FD to non-blocking
-        if (fcntl(named_pipe_fd_read, F_SETFL, O_NONBLOCK) < 0) {
-            perror("fcntl on named_pipe_fd_read failed");
-            running = false; // Signal to proceed to cleanup
-        }
-    }
+        
+        if (nfds_to_poll == 0) break; // Should be caught by the check above, but for safety
 
-    if (running) {
-        fprintf(stdout, "Starting data piping loop...\n");
-    }
+        int poll_ret = poll(current_fds, nfds_to_poll, 250); // Timeout in ms to check quit_flag
 
-    while (running) {
-        struct pollfd fds[2];
-        fds[0].fd = named_pipe_fd_read; // Data from Klipper/Termux file
-        fds[0].events = POLLIN;
-        fds[1].fd = dev_channel.fd_read; // Data from USB serial device
-        fds[1].events = POLLIN;
-
-        int poll_res = poll(fds, 2, 100); // 100ms timeout
-
-        if (poll_res < 0) {
-            if (errno == EINTR) continue; // Interrupted by signal, loop again
-            perror("poll failed");
-            running = false;
+        if (poll_ret < 0) {
+            if (errno == EINTR) continue; // Interrupted by signal, check quit_flag
+            std::cerr << "poll error: " << strerror(errno) << std::endl;
+            quit_flag.store(true); // Trigger shutdown on poll error
             break;
         }
-
-        if (poll_res == 0) {
-            // Timeout, just run usbuart loop and continue
-            if (ctx.loop(10) < 0) { // Minimal timeout for libusb event handling
-                 fprintf(stderr, "ctx.loop error during poll timeout.\n");
-                 // Consider if this is fatal, or if status check below handles it
-            }
-            if (ctx.status(dev_channel) != usbuart::status_t::alles_gute) {
-                fprintf(stderr, "USB Device status not OK after poll timeout. Shutting down.\n");
-                running = false;
-            }
+        if (poll_ret == 0) { // Timeout
             continue;
         }
 
-        // Check for data from named pipe (to be sent to USB)
-        if (fds[0].revents & POLLIN) {
-            ssize_t bytes_read = read(named_pipe_fd_read, buffer, sizeof(buffer));
-            if (bytes_read > 0) {
-                ssize_t bytes_written = write(dev_channel.fd_write, buffer, bytes_read);
-                if (bytes_written < 0) {
-                    perror("Error writing to usbuart dev_channel.fd_write");
-                    running = false; // Or handle error more gracefully
-                } else if (bytes_written < bytes_read) {
-                    fprintf(stderr, "Partial write to usbuart dev_channel.fd_write: %zd/%zd\n", bytes_written, bytes_read);
-                    // May need to handle partial writes by retrying, but usbuart pipe should buffer
-                } else {
-                    // fprintf(stdout, "Wrote %zd bytes to USB\n", bytes_written);
+        // Check which FDs are ready by iterating through the ones we polled
+        for (int i = 0; i < nfds_to_poll; ++i) {
+            if (current_fds[i].revents == 0) continue; // No events for this FD
+
+            if (current_fds[i].revents & (POLLERR | POLLNVAL)) {
+                std::cerr << "Error event on polled FD " << current_fds[i].fd << std::endl;
+                if (current_fds[i].fd == fds[0].fd) pipe_user_read_eof = true;
+                if (current_fds[i].fd == fds[1].fd) termux_usb_read_eof = true;
+                continue;
+            }
+
+            if (current_fds[i].revents & (POLLIN | POLLHUP)) {
+                ssize_t bytes_read = read(current_fds[i].fd, buffer, sizeof(buffer));
+                if (bytes_read < 0) {
+                    if (errno == EINTR) continue;
+                    std::cerr << "read error on fd " << current_fds[i].fd << ": " << strerror(errno) << std::endl;
+                    if (current_fds[i].fd == fds[0].fd) pipe_user_read_eof = true;
+                    if (current_fds[i].fd == fds[1].fd) termux_usb_read_eof = true;
+                } else if (bytes_read == 0 || (current_fds[i].revents & POLLHUP)) { // EOF or HUP
+                    std::cout << "EOF/HUP on fd " << current_fds[i].fd << std::endl;
+                    if (current_fds[i].fd == fds[0].fd) { // User input pipe closed
+                        pipe_user_read_eof = true;
+                        // Optionally, signal EOF to USB write side if usbuart supports it (e.g., shutdown WR)
+                        // For now, usbuart_close will handle it during cleanup.
+                        // Or, if we want to close just the write part to USB:
+                        // if(termux_usb_channel.fd_write != -1) close(termux_usb_channel.fd_write);
+                        // termux_usb_channel.fd_write = -1; // Mark as closed
+                        // However, usbuart library manages these FDs; direct close might be bad.
+                    }
+                    if (current_fds[i].fd == fds[1].fd) { // USB read pipe closed
+                        termux_usb_read_eof = true;
+                        // Close our write end to the user pipe to signal EOF
+                        if (pipe_user_write_fd != -1) {
+                           close(pipe_user_write_fd);
+                           pipe_user_write_fd = -1; // Mark as closed by us
+                        }
+                    }
+                } else { // Data read
+                    if (current_fds[i].fd == fds[0].fd) { // Data from user_pipe -> to USB
+                        // std::cout << "Relaying " << bytes_read << " bytes from pipe to USB" << std::endl;
+                        if (!write_all(termux_usb_channel.fd_write, buffer, bytes_read)) {
+                            std::cerr << "Failed to write all data to USB channel. Shutting down." << std::endl;
+                            quit_flag.store(true);
+                        }
+                    } else if (current_fds[i].fd == fds[1].fd) { // Data from USB -> to user_pipe
+                        // std::cout << "Relaying " << bytes_read << " bytes from USB to pipe" << std::endl;
+                        if (pipe_user_write_fd != -1) { // Check if not already closed
+                            if (!write_all(pipe_user_write_fd, buffer, bytes_read)) {
+                                std::cerr << "Failed to write all data to named pipe. Shutting down." << std::endl;
+                                quit_flag.store(true);
+                            }
+                        } else {
+                            std::cerr << "USB data received, but pipe_user_write_fd already closed." << std::endl;
+                        }
+                    }
                 }
-            } else if (bytes_read == 0) {
-                fprintf(stdout, "Named pipe read EOF (Klipper closed?). Shutting down.\n");
-                running = false; // EOF from named pipe
-            } else { // bytes_read < 0
-                if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                    perror("Error reading from named pipe");
-                    running = false;
-                }
             }
-        }
-
-        // Check for data from USB serial device (to be sent to named pipe)
-        if (running && fds[1].revents & POLLIN) { // Check running again in case previous block set it to false
-            ssize_t bytes_read = read(dev_channel.fd_read, buffer, sizeof(buffer));
-            if (bytes_read > 0) {
-                ssize_t bytes_written = write(named_pipe_fd_write, buffer, bytes_read);
-                if (bytes_written < 0) {
-                    perror("Error writing to named pipe");
-                    running = false; // Or handle error
-                } else if (bytes_written < bytes_read) {
-                    fprintf(stderr, "Partial write to named_pipe_fd_write: %zd/%zd\n", bytes_written, bytes_read);
-                    // May need to handle this, though named pipes should typically block or accept all
-                } else {
-                     // fprintf(stdout, "Wrote %zd bytes to Pipe\n", bytes_written);
-                }
-            } else if (bytes_read == 0) {
-                // This case should ideally not happen with usbuart's pipe model if device is ok
-                fprintf(stderr, "usbuart dev_channel.fd_read EOF. Shutting down.\n");
-                running = false; 
-            } else { // bytes_read < 0
-                if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                    perror("Error reading from usbuart dev_channel.fd_read");
-                    running = false;
-                }
-            }
-        }
-        
-        if (running && (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL))) {
-            fprintf(stderr, "Error/Hangup on named_pipe_fd_read. Shutting down.\n");
-            running = false;
-        }
-        if (running && (fds[1].revents & (POLLERR | POLLHUP | POLLNVAL))) {
-            fprintf(stderr, "Error/Hangup on dev_channel.fd_read. Shutting down.\n");
-            running = false;
-        }
-
-
-        // Run libusb event loop
-        if (running && ctx.loop(10) < 0) { // Minimal timeout for libusb event handling
-            // Error in ctx.loop might indicate device disconnection or serious issue
-            // fprintf(stderr, "ctx.loop error during active poll. Shutting down.\n");
-            // running = false; // The status check below should also catch this
-        }
-        
-        // Check overall status
-        if (running && ctx.status(dev_channel) != usbuart::status_t::alles_gute) {
-            int current_status = ctx.status(dev_channel);
-            fprintf(stderr, "USB Device status not OK (status: %d). Shutting down.\n", current_status);
-            if (!(current_status & usbuart::status_t::usb_dev_ok)) {
-                fprintf(stderr, "USB device disconnected or error.\n");
-            }
-            if (!(current_status & usbuart::status_t::read_pipe_ok)) {
-                fprintf(stderr, "USB read pipe not OK.\n");
-            }
-            if (!(current_status & usbuart::status_t::write_pipe_ok)) {
-                fprintf(stderr, "USB write pipe not OK.\n");
-            }
-            running = false;
-        }
-    } // end while(running)
-
-    // Cleanup FDs for named pipe
-    if (named_pipe_fd_read >= 0) {
-        close(named_pipe_fd_read);
-        named_pipe_fd_read = -1;
-    }
-    if (named_pipe_fd_write >= 0) {
-        close(named_pipe_fd_write);
-        named_pipe_fd_write = -1;
-    }
-
-    // usbuart closing logic is already below this replaced block
-    fprintf(stdout, "Closing usbuart channel...\n");
-    ctx.close(dev_channel);
-    // Short loop to allow usbuart to process close events
-    for(int i=0; i<5; ++i) {
-        ctx.loop(10); 
-        usleep(10000); // 10ms
-    }
-
-
-    if (!named_pipe_path_global.empty()) {
-        fprintf(stdout, "Cleaning up named pipe: %s\n", named_pipe_path_global.c_str());
-        // Check if it was our creation or if it existed before.
-        // For simplicity here, always unlink. If Klipper created it, it might need to re-create.
-        // Or, only unlink if mkfifo actually created it (check errno != EEXIST before).
-        // The current logic only unlinks if mkfifo succeeded (errno != EEXIST).
-        // However, the global flag `named_pipe_path_global` is set regardless.
-        // Let's refine: only unlink if we successfully created it.
-        // For now, this is fine as it is.
-        if (unlink(named_pipe_path_global.c_str()) == -1) {
-            if (errno != ENOENT) { // Don't error if it's already gone
-                 perror("unlink failed");
-            }
-        } else {
-            fprintf(stdout, "Named pipe %s unlinked.\n", named_pipe_path_global.c_str());
+             if (quit_flag.load()) break; // check after each FD processing
         }
     }
+    std::cout << "Relay poll loop finished." << std::endl;
 
-    fprintf(stdout, "Exiting.\n");
-    return 0;
+    // 8. Cleanup
+    std::cout << "Initiating cleanup..." << std::endl;
+    quit_flag.store(true); // Ensure quit flag is set for other parts
+
+    // Close local ends of the named pipe first
+    if (pipe_user_read_fd >= 0) {
+        close(pipe_user_read_fd);
+        pipe_user_read_fd = -1;
+    }
+    if (pipe_user_write_fd >= 0) { // Might be already closed if termux_usb_read_eof caused it
+        close(pipe_user_write_fd);
+        pipe_user_write_fd = -1;
+    }
+
+    // Close the usbuart channel. This should signal the usbuart_loop to stop processing for this channel.
+    if (termux_usb_channel.fd_read != -1 || termux_usb_channel.fd_write != -1) {
+        std::cout << "Closing USB UART channel..." << std::endl;
+        uart_ctx.close(termux_usb_channel);
+        // The FDs within termux_usb_channel are now closed by the library
+        termux_usb_channel = usbuart::bad_channel;
+    }
+
+    // Wait for the usbuart_loop thread to finish
+    if (uart_loop_thread.joinable()) {
+        std::cout << "Waiting for usbuart_loop thread to join..." << std::endl;
+        uart_loop_thread.join();
+        std::cout << "usbuart_loop thread joined." << std::endl;
+    }
+
+    // Remove the named pipe
+    std::cout << "Unlinking named pipe: " << PIPE_NAME << std::endl;
+    if (unlink(PIPE_NAME) < 0) {
+        std::cerr << "Warning: unlink(\"" << PIPE_NAME << "\") failed: " << strerror(errno) << std::endl;
+    }
+
+    // The original usb_dev_fd (from TERMUX_USB_FD) is managed by termux-usb process.
+    // We don't close it.
+
+    std::cout << "Cleanup complete. Exiting." << std::endl;
+    return EXIT_SUCCESS;
 }
