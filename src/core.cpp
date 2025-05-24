@@ -720,8 +720,7 @@ public:
 
 		struct libusb_device_descriptor desc;
 		assert(!libusb_get_device_descriptor(device, &desc));
-		printf("Vendor ID: %04x\n", desc.idVendor);
-		printf("Product ID: %04x\n", desc.idProduct);
+		log.i(__, "Device VID:PID %04x:%04x", desc.idVendor, desc.idProduct);
 
 		return device;
 	}
@@ -739,7 +738,7 @@ public:
 		bool ok1 = false, ok2 = false;
 		if( dev == nullptr ) return -error_t::no_device;
 
-		printf("HANDLE: %p\n", handle);
+		log.d(__,"Attach: dev=%p, ifc=%d, pipes=%d, handle=%p", dev, ifc, pipes, handle);
 		transaction<driver> drv(ok1, create(dev, ifc, handle));
 		transaction<file_channel> child(ok2, (pipes ?
 			new pipe_channel(*this, ch, drv):new file_channel(*this, ch, drv)));
@@ -858,12 +857,14 @@ public:
 		}
 
 		bool success = false;
-		printf("SUCCESS: %d\n", success);
+		// printf("SUCCESS: %d\n", success); // Original line
 		transaction<libusb_device_handle> begin(success, devh);
-		printf("SUCCESS1: %d\n", success);
+		// printf("SUCCESS1: %d\n", success); // Original line
+		log.d(__, "Creating driver for devh=%p, id=%d", devh, id);
 		driver* result = registrar().create(devh,id);
-		printf("SUCCESS2: %d\n", success);
+		// printf("SUCCESS2: %d\n", success); // Original line
 		success = result != nullptr;
+		log.d(__, "Driver creation %s for devh=%p", success ? "succeeded" : "failed", devh);
 		return result;
 	}
 

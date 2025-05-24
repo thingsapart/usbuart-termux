@@ -34,7 +34,7 @@ MAKEFLAGS += --no-builtin-rules
 
 SRC-DIRS := src
 
-INCLUDES := include $(PREFIX)/include/libusb-1.0 libusb/libusb
+INCLUDES := include libusb/libusb # Removed $(PREFIX)/include/libusb-1.0
 
 .PHONY: all
 
@@ -58,10 +58,12 @@ OBJS :=																		\
 
 CPPFLAGS += 																\
   $(addprefix -I,$(INCLUDES))												\
+  $(shell pkg-config --cflags libusb-1.0)                                   \
   $(addprefix -D,$(CXX-DEFS))												\
   $(if $(V),-v,)															\
   -Wall																		\
   -Wextra																	\
+  -fPIC																	\
   -O0																		\
   -std=c++1y  																\
   #-fmessage-length=0														\
@@ -75,6 +77,7 @@ CPPFLAGS_DEBUG += 																\
   -Wall																		\
   -Wextra																	\
   -O0																		\
+  -fPIC																	\
   -std=c++1y  																\
   #-fmessage-length=0														\
   #-ffunction-sections  														\
@@ -83,9 +86,11 @@ CPPFLAGS_DEBUG += 																\
 
 CFLAGS += 																	\
   $(addprefix -I,$(INCLUDES))												\
+  $(shell pkg-config --cflags libusb-1.0)                                   \
   $(addprefix -D,$(CXX-DEFS))												\
   $(if $(V),-v,)															\
   -Wall																		\
+  -fPIC																	\
   -O0																		\
   #-ffunction-sections 														\
   #-fdata-sections 															\
@@ -142,3 +147,8 @@ test: examples/test.o
 	@echo "    $(BOLD)ld$(NORM) " $(notdir $@)
 	@echo $(LD) $(LDFLAGS_DEBUG) -o $@ $^
 	$(LD) $(LDFLAGS_DEBUG) -L$(PREFIX)/lib/libusb-1.0 -L./bin -lusb-1.0 -lusbuart -o $@ $^
+
+termux_uart_bridge: examples/termux_uart_bridge.o $(TARGET-DIR)/libusbuart.so
+	@echo "    $(BOLD)ld$(NORM) " $(notdir $@)
+	@echo $(LD) $(LDFLAGS_DEBUG) -L$(TARGET-DIR) -Iinclude -o $@ $< -lusbuart -lusb-1.0 $(shell pkg-config --libs libusb-1.0)
+	$(LD) $(LDFLAGS_DEBUG) -L$(TARGET-DIR) -Iinclude -o $@ $< -lusbuart -lusb-1.0 $(shell pkg-config --libs libusb-1.0)
